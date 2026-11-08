@@ -30,14 +30,14 @@ Binds `iqkv.notification.mail.*`:
 
 ```yaml
 iqkv:
-    notification:
-        mail:
-            from: no-reply@example.com
-            from-name: Example
-            reply-to: support@example.com
-            provider: smtp # smtp (default) or resend
-            resend:
-                api-key: ${RESEND_API_KEY}
+  notification:
+    mail:
+      from: no-reply@example.com
+      from-name: Example
+      reply-to: support@example.com
+      provider: smtp # smtp (default) or resend
+      resend:
+        api-key: ${RESEND_API_KEY}
 ```
 
 ## Usage
