@@ -1,0 +1,145 @@
+name: "Publish to Maven Central"
+
+on:
+  release:
+    types: [created]
+
+env:
+  MAVEN_ARGS: -B -V --no-transfer-progress
+
+jobs:
+  publish:
+    name: "Publish to Maven Central"
+    runs-on: ubuntu-latest
+    if: github.event.release.target_commitish == 'maven-central'
+
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: "Set up JDK 25"
+        uses: actions/setup-java@v6
+        with:
+          java-version: "25"
+          distribution: "corretto"
+          cache: maven
+          server-id: central
+          server-username: CENTRAL_TOKEN_USERNAME
+          server-password: CENTRAL_TOKEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: "Configure Git User"
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+
+      - name: "Extract and Prepare Release Version"
+        id: extract_version
+        env:
+          MAVEN_ARGS: -B -q --no-transfer-progress
+        run: |
+          CURRENT_VERSION=$(mvn help:evaluate -Dexpression=project.version -DforceStdout | tail -n1)
+          if [[ -z "$CURRENT_VERSION" ]]; then echo "Error: Could not extract version from POM"; exit 1; fi
+          echo "Current POM version: $CURRENT_VERSION"
+          if [[ "$CURRENT_VERSION" == *"-SNAPSHOT" ]]; then
+            RELEASE_VERSION=${CURRENT_VERSION%-SNAPSHOT}
+          else
+            RELEASE_VERSION="$CURRENT_VERSION"
+          fi
+          echo "VERSION=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+          echo "ORIGINAL_VERSION=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: "Validate Release Version"
+        run: |
+          VERSION="${{ steps.extract_version.outputs.VERSION }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
+            echo "Warning: Version '$VERSION' doesn't follow semantic versioning format"
+          fi
+          echo "✅ Release version validated: $VERSION"
+
+      - name: "Update POM to Release Version"
+        run: |
+          VERSION="${{ steps.extract_version.outputs.VERSION }}"
+          ORIGINAL_VERSION="${{ steps.extract_version.outputs.ORIGINAL_VERSION }}"
+          if [[ "$ORIGINAL_VERSION" != "$VERSION" ]]; then
+            mvn ${MAVEN_ARGS} versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
+            NEW_VERSION=$(mvn -B -q --no-transfer-progress help:evaluate -Dexpression=project.version -DforceStdout | tail -n1)
+            if [[ "$NEW_VERSION" != "$VERSION" ]]; then
+              echo "Error: Version update failed. Expected: $VERSION, Got: $NEW_VERSION"; exit 1
+            fi
+            echo "POM version updated to: $NEW_VERSION"
+          else
+            echo "POM already has release version: $VERSION"
+          fi
+
+      - name: "Sign artifacts"
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: mvn ${MAVEN_ARGS} clean verify -P maven-central -Dmaven.install.skip=true
+
+      - name: "Build and upload bundle manually"
+        env:
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.extract_version.outputs.VERSION }}"
+          GROUP_PATH="com/iqkv/foundation-mail"
+          ARTIFACT="foundation-mail"
+          STAGING="target/manual-staging/${GROUP_PATH}/${VERSION}"
+          mkdir -p "${STAGING}"
+
+          for EXT in pom jar; do
+            cp "$([ "$EXT" = "pom" ] && echo pom.xml || echo target/${ARTIFACT}-${VERSION}.${EXT})" \
+               "${STAGING}/${ARTIFACT}-${VERSION}.${EXT}"
+            cp "target/${ARTIFACT}-${VERSION}.${EXT}.asc" "${STAGING}/${ARTIFACT}-${VERSION}.${EXT}.asc"
+            for ALGO in md5 sha1 sha256 sha512; do
+              ${ALGO}sum "${STAGING}/${ARTIFACT}-${VERSION}.${EXT}" | awk '{print $1}' \
+                > "${STAGING}/${ARTIFACT}-${VERSION}.${EXT}.${ALGO}"
+            done
+          done
+
+          for CLASSIFIER in sources javadoc; do
+            cp "target/${ARTIFACT}-${VERSION}-${CLASSIFIER}.jar" \
+               "${STAGING}/${ARTIFACT}-${VERSION}-${CLASSIFIER}.jar"
+            cp "target/${ARTIFACT}-${VERSION}-${CLASSIFIER}.jar.asc" \
+               "${STAGING}/${ARTIFACT}-${VERSION}-${CLASSIFIER}.jar.asc"
+            for ALGO in md5 sha1 sha256 sha512; do
+              ${ALGO}sum "${STAGING}/${ARTIFACT}-${VERSION}-${CLASSIFIER}.jar" | awk '{print $1}' \
+                > "${STAGING}/${ARTIFACT}-${VERSION}-${CLASSIFIER}.jar.${ALGO}"
+            done
+          done
+
+          echo "Bundle contents:"; find "target/manual-staging" -type f | sort
+          cd target/manual-staging; zip -r "../central-bundle.zip" .; cd -
+          echo "Zip contents:"; unzip -l target/central-bundle.zip
+
+          RESPONSE=$(curl --silent --show-error --fail-with-body \
+            --request POST \
+            --header "Authorization: Bearer $(echo -n "${CENTRAL_TOKEN_USERNAME}:${CENTRAL_TOKEN_PASSWORD}" | base64 -w0)" \
+            --form "bundle=@target/central-bundle.zip" \
+            "https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC")
+          echo "Upload response: ${RESPONSE}"
+          DEPLOYMENT_ID="${RESPONSE}"
+
+          for i in $(seq 1 60); do
+            sleep 30
+            BODY=$(curl --silent --fail \
+              --header "Authorization: Bearer $(echo -n "${CENTRAL_TOKEN_USERNAME}:${CENTRAL_TOKEN_PASSWORD}" | base64 -w0)" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=${DEPLOYMENT_ID}" || true)
+            if [[ -z "${BODY}" ]]; then echo "Empty response — likely completed"; break; fi
+            STATUS=$(echo "${BODY}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('deploymentState','UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
+            echo "[$i/60] ${DEPLOYMENT_ID} state: ${STATUS}"
+            if [[ "${STATUS}" == "PUBLISHED" ]]; then echo "✅ Published"; exit 0; fi
+            if [[ "${STATUS}" == "FAILED" ]]; then echo "❌ Failed"; echo "${BODY}"; exit 1; fi
+          done
+
+          sleep 10
+          HTTP_CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            "https://repo1.maven.org/maven2/${GROUP_PATH}/${VERSION}/${ARTIFACT}-${VERSION}.pom")
+          [[ "${HTTP_CODE}" == "200" ]] \
+            && echo "✅ Confirmed live on Maven Central" \
+            || echo "⚠️  Not yet visible (HTTP ${HTTP_CODE}) — check https://central.sonatype.com/publishing/deployments"
